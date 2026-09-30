@@ -123,7 +123,7 @@ const ISSUE_SNAPSHOT_FIELDS = `
   parent { identifier }
   assignee { name displayName }
   labels(first: 20) { nodes { name } }
-  inverseRelations(first: 25) { nodes { type issue { id } } }
+  inverseRelations(first: 25) { nodes { type issue { id } } pageInfo { hasNextPage } }
 `;
 
 const ISSUE_SNAPSHOT_QUERY = `
@@ -143,6 +143,23 @@ const CHILD_ISSUE_SNAPSHOTS_QUERY = `
   }
 `;
 
+/**
+ * Fetches all inverse relations of one issue. Used only when the snapshot's
+ * first page of relations was incomplete, so no blocker is silently dropped.
+ */
+const INVERSE_RELATIONS_QUERY = `
+  query RalphInverseRelations($id: String!, $after: String) {
+    issue(id: $id) {
+      inverseRelations(first: 100, after: $after) {
+        nodes { type issue { id } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+
+type RawRelation = { type: string; issue?: { id: string } | null };
+
 /** Raw GraphQL shape of an issue returned by the snapshot queries. */
 interface RawIssueSnapshot {
   id: string;
@@ -157,7 +174,37 @@ interface RawIssueSnapshot {
   parent?: { identifier: string } | null;
   assignee?: { name: string; displayName?: string | null } | null;
   labels?: { nodes: Array<{ name: string }> } | null;
-  inverseRelations?: { nodes: Array<{ type: string; issue?: { id: string } | null }> } | null;
+  inverseRelations?: {
+    nodes: RawRelation[];
+    pageInfo?: { hasNextPage: boolean } | null;
+  } | null;
+}
+
+/** IDs of the issues that block an issue, given its inverse relations. */
+function blockerIds(relations: RawRelation[]): string[] {
+  return relations
+    .filter((rel) => rel.type === 'blocks' && rel.issue)
+    .map((rel) => rel.issue!.id);
+}
+
+/**
+ * Return the cursor for the next page, or undefined when there are no more pages.
+ * Throws when the server reports more pages but the cursor didn't advance,
+ * which would otherwise loop forever.
+ */
+function nextPageCursor(
+  pageInfo: { hasNextPage: boolean; endCursor?: string | null },
+  previous: string | undefined,
+  description: string,
+): string | undefined {
+  const next = pageInfo.hasNextPage && pageInfo.endCursor ? pageInfo.endCursor : undefined;
+  if (next && next === previous) {
+    throw new LinearApiError(
+      `Linear returned a repeated pagination cursor for ${description}.`,
+      'unknown',
+    );
+  }
+  return next;
 }
 
 function toIssueSnapshot(raw: RawIssueSnapshot): LinearIssueSnapshot {
@@ -174,9 +221,7 @@ function toIssueSnapshot(raw: RawIssueSnapshot): LinearIssueSnapshot {
     parentIdentifier: raw.parent?.identifier ?? null,
     assigneeName: raw.assignee?.displayName || raw.assignee?.name || null,
     labels: (raw.labels?.nodes ?? []).map((l) => l.name),
-    blockedByIds: (raw.inverseRelations?.nodes ?? [])
-      .filter((rel) => rel.type === 'blocks' && rel.issue)
-      .map((rel) => rel.issue!.id),
+    blockedByIds: blockerIds(raw.inverseRelations?.nodes ?? []),
   };
 }
 
@@ -391,7 +436,7 @@ export class RalphLinearClient {
       );
     }
 
-    return toIssueSnapshot(data.issue);
+    return this.completeSnapshot(data.issue);
   }
 
   /**
@@ -426,20 +471,65 @@ export class RalphLinearClient {
         }
 
         const { nodes, pageInfo } = data.issue.children;
-        snapshots.push(...nodes.map(toIssueSnapshot));
-
-        const nextCursor = pageInfo.hasNextPage && pageInfo.endCursor ? pageInfo.endCursor : undefined;
-        // Guard against a cursor that doesn't advance, which would otherwise loop forever
-        if (nextCursor && nextCursor === after) {
-          throw new LinearApiError(
-            `Linear returned a repeated pagination cursor for children of "${parentId}".`,
-            'unknown',
-          );
-        }
-        after = nextCursor;
+        snapshots.push(...(await Promise.all(nodes.map((node) => this.completeSnapshot(node)))));
+        after = nextPageCursor(pageInfo, after, `children of "${parentId}"`);
       } while (after);
 
       return snapshots;
+    } catch (err) {
+      throw classifyError(err);
+    }
+  }
+
+  /**
+   * Convert a raw issue to a snapshot, fetching the rest of its inverse
+   * relations when the snapshot query returned only the first page.
+   */
+  private async completeSnapshot(raw: RawIssueSnapshot): Promise<LinearIssueSnapshot> {
+    const snapshot = toIssueSnapshot(raw);
+    if (raw.inverseRelations?.pageInfo?.hasNextPage) {
+      snapshot.blockedByIds = await this.getAllBlockerIds(raw.id);
+    }
+    return snapshot;
+  }
+
+  /**
+   * Get the IDs of every issue that blocks the given issue, across all pages
+   * of its inverse relations.
+   */
+  private async getAllBlockerIds(issueId: string): Promise<string[]> {
+    type RelationsData = {
+      issue?: {
+        inverseRelations: {
+          nodes: RawRelation[];
+          pageInfo: { hasNextPage: boolean; endCursor?: string | null };
+        };
+      } | null;
+    };
+
+    try {
+      const ids: string[] = [];
+      let after: string | undefined;
+
+      do {
+        const data: RelationsData = await this.client.client.request<
+          RelationsData,
+          { id: string; after?: string }
+        >(INVERSE_RELATIONS_QUERY, { id: issueId, after });
+
+        if (!data.issue) {
+          throw new LinearApiError(
+            `Issue "${issueId}" not found or inaccessible.`,
+            'not_found',
+          );
+        }
+
+        const { nodes, pageInfo } = data.issue.inverseRelations;
+        ids.push(...blockerIds(nodes));
+        after = nextPageCursor(pageInfo, after, `relations of "${issueId}"`);
+      } while (after);
+
+      return ids;
     } catch (err) {
       throw classifyError(err);
     }

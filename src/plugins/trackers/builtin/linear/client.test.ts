@@ -454,6 +454,59 @@ describe('RalphLinearClient', () => {
       });
     });
 
+    test('fetches remaining blockers when relations are truncated', async () => {
+      mockSdkResponses.request = (query, variables) => {
+        if (!query.includes('RalphInverseRelations')) {
+          return {
+            issue: {
+              ...rawIssue,
+              inverseRelations: {
+                nodes: [{ type: 'related', issue: { id: 'uuid-related' } }],
+                pageInfo: { hasNextPage: true },
+              },
+            },
+          };
+        }
+        return {
+          issue: {
+            inverseRelations: variables.after
+              ? {
+                  nodes: [{ type: 'blocks', issue: { id: 'uuid-blocker-2' } }],
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                }
+              : {
+                  nodes: [
+                    { type: 'related', issue: { id: 'uuid-related' } },
+                    { type: 'blocks', issue: { id: 'uuid-blocker-1' } },
+                  ],
+                  pageInfo: { hasNextPage: true, endCursor: 'r1' },
+                },
+          },
+        };
+      };
+
+      const client = createClient();
+      const snapshot = await client.getIssueSnapshot('ENG-10');
+
+      expect(snapshot.blockedByIds).toEqual(['uuid-blocker-1', 'uuid-blocker-2']);
+      expect(mockSdkCalls.request.length).toBe(3);
+      expect(mockSdkCalls.request[1].variables).toEqual({ id: 'uuid-10', after: undefined });
+      expect(mockSdkCalls.request[2].variables).toEqual({ id: 'uuid-10', after: 'r1' });
+    });
+
+    test('makes no follow-up request when relations fit on one page', async () => {
+      mockSdkResponses.request = () => ({
+        issue: {
+          ...rawIssue,
+          inverseRelations: { ...rawIssue.inverseRelations, pageInfo: { hasNextPage: false } },
+        },
+      });
+
+      const client = createClient();
+      await client.getIssueSnapshot('ENG-10');
+      expect(mockSdkCalls.request.length).toBe(1);
+    });
+
     test('throws not_found when issue is missing', async () => {
       mockSdkResponses.request = () => ({ issue: null });
 
