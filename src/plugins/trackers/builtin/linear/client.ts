@@ -427,7 +427,16 @@ export class RalphLinearClient {
 
         const { nodes, pageInfo } = data.issue.children;
         snapshots.push(...nodes.map(toIssueSnapshot));
-        after = pageInfo.hasNextPage && pageInfo.endCursor ? pageInfo.endCursor : undefined;
+
+        const nextCursor = pageInfo.hasNextPage && pageInfo.endCursor ? pageInfo.endCursor : undefined;
+        // Guard against a cursor that doesn't advance, which would otherwise loop forever
+        if (nextCursor && nextCursor === after) {
+          throw new LinearApiError(
+            `Linear returned a repeated pagination cursor for children of "${parentId}".`,
+            'unknown',
+          );
+        }
+        after = nextCursor;
       } while (after);
 
       return snapshots;

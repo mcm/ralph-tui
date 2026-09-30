@@ -500,6 +500,24 @@ describe('RalphLinearClient', () => {
       expect(children[0].blockedByIds).toEqual([]);
       expect(mockSdkCalls.issue.length).toBe(0);
     });
+
+    test('throws instead of looping when the cursor does not advance', async () => {
+      mockSdkResponses.request = () => ({
+        issue: {
+          children: { nodes: [rawChild(1)], pageInfo: { hasNextPage: true, endCursor: 'stuck' } },
+        },
+      });
+
+      const client = createClient();
+      try {
+        await client.getChildIssueSnapshots('ENG-1');
+        expect(true).toBe(false);
+      } catch (err) {
+        expect(err).toBeInstanceOf(LinearApiError);
+        expect((err as LinearApiError).message).toContain('repeated pagination cursor');
+      }
+      expect(mockSdkCalls.request.length).toBe(2);
+    });
   });
 
   describe('addComment', () => {
