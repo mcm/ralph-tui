@@ -19,6 +19,8 @@ let mockSdkCalls: {
   createIssueLabel: Array<{ input: unknown }>;
   project: Array<{ id: string }>;
   projects: number;
+  updateIssue: Array<{ id: string; input: unknown }>;
+  request: Array<{ query: string; variables: Record<string, unknown> }>;
 };
 
 let mockSdkResponses: {
@@ -32,6 +34,7 @@ let mockSdkResponses: {
   createIssueLabel: (input: unknown) => unknown;
   project: (id: string) => unknown;
   projects: () => unknown;
+  request: (query: string, variables: Record<string, unknown>) => unknown;
   viewer: unknown;
 };
 
@@ -47,6 +50,8 @@ function resetMocks(): void {
     createIssueLabel: [],
     project: [],
     projects: 0,
+    updateIssue: [],
+    request: [],
   };
 
   mockSdkResponses = {
@@ -60,6 +65,7 @@ function resetMocks(): void {
     createIssueLabel: () => ({ issueLabel: Promise.resolve({ id: 'label-1', name: 'test' }) }),
     project: () => ({ id: 'proj-1', name: 'Project' }),
     projects: () => ({ nodes: [] }),
+    request: () => ({}),
     viewer: { id: 'user-1', name: 'Test User' },
   };
 }
@@ -70,6 +76,16 @@ mock.module('@linear/sdk', () => {
     LinearClient: class MockLinearClient {
       constructor() {
         // Constructor receives { apiKey } but we don't need it for mocking
+      }
+      client = {
+        request: async (query: string, variables: Record<string, unknown>) => {
+          mockSdkCalls.request.push({ query, variables });
+          return mockSdkResponses.request(query, variables);
+        },
+      };
+      async updateIssue(id: string, input: unknown) {
+        mockSdkCalls.updateIssue.push({ id, input });
+        return {};
       }
       get viewer() {
         return Promise.resolve(mockSdkResponses.viewer);
@@ -381,18 +397,108 @@ describe('RalphLinearClient', () => {
   });
 
   describe('updateIssueState', () => {
-    test('updates issue state', async () => {
-      mockSdkResponses.issue = () => ({
-        id: 'uuid-1',
-        update: (input: unknown) => {
-          expect(input).toEqual({ stateId: 'state-done' });
-          return Promise.resolve({});
+    test('updates issue state with a single mutation', async () => {
+      const client = createClient();
+      await client.updateIssueState('ENG-1', 'state-done');
+      expect(mockSdkCalls.updateIssue).toEqual([
+        { id: 'ENG-1', input: { stateId: 'state-done' } },
+      ]);
+      expect(mockSdkCalls.issue.length).toBe(0);
+    });
+  });
+
+  describe('getIssueSnapshot', () => {
+    const rawIssue = {
+      id: 'uuid-10',
+      identifier: 'ENG-10',
+      title: 'Story',
+      description: 'Body',
+      url: 'https://linear.app/ENG-10',
+      createdAt: '2025-01-01T00:00:00.000Z',
+      updatedAt: '2025-01-02T00:00:00.000Z',
+      state: { type: 'started' },
+      team: { id: 'team-1' },
+      parent: { identifier: 'ENG-1' },
+      assignee: { name: 'jdoe', displayName: 'Jane' },
+      labels: { nodes: [{ name: 'backend' }] },
+      inverseRelations: {
+        nodes: [
+          { type: 'blocks', issue: { id: 'uuid-blocker' } },
+          { type: 'related', issue: { id: 'uuid-related' } },
+        ],
+      },
+    };
+
+    test('flattens all fields from one request', async () => {
+      mockSdkResponses.request = () => ({ issue: rawIssue });
+
+      const client = createClient();
+      const snapshot = await client.getIssueSnapshot('ENG-10');
+
+      expect(mockSdkCalls.request.length).toBe(1);
+      expect(mockSdkCalls.request[0].variables).toEqual({ id: 'ENG-10' });
+      expect(snapshot).toEqual({
+        id: 'uuid-10',
+        identifier: 'ENG-10',
+        title: 'Story',
+        description: 'Body',
+        url: 'https://linear.app/ENG-10',
+        createdAt: '2025-01-01T00:00:00.000Z',
+        updatedAt: '2025-01-02T00:00:00.000Z',
+        stateType: 'started',
+        teamId: 'team-1',
+        parentIdentifier: 'ENG-1',
+        assigneeName: 'Jane',
+        labels: ['backend'],
+        blockedByIds: ['uuid-blocker'],
+      });
+    });
+
+    test('throws not_found when issue is missing', async () => {
+      mockSdkResponses.request = () => ({ issue: null });
+
+      const client = createClient();
+      try {
+        await client.getIssueSnapshot('ENG-999');
+        expect(true).toBe(false);
+      } catch (err) {
+        expect(err).toBeInstanceOf(LinearApiError);
+        expect((err as LinearApiError).kind).toBe('not_found');
+      }
+    });
+  });
+
+  describe('getChildIssueSnapshots', () => {
+    function rawChild(n: number) {
+      return {
+        id: `uuid-${n}`,
+        identifier: `ENG-${n}`,
+        title: `Child ${n}`,
+        url: `https://linear.app/ENG-${n}`,
+        createdAt: '2025-01-01T00:00:00.000Z',
+        updatedAt: '2025-01-01T00:00:00.000Z',
+        state: { type: 'unstarted' },
+      };
+    }
+
+    test('fetches one request per page of children', async () => {
+      mockSdkResponses.request = (_query, variables) => ({
+        issue: {
+          children: variables.after
+            ? { nodes: [rawChild(3)], pageInfo: { hasNextPage: false, endCursor: null } }
+            : { nodes: [rawChild(1), rawChild(2)], pageInfo: { hasNextPage: true, endCursor: 'c1' } },
         },
       });
 
       const client = createClient();
-      await client.updateIssueState('ENG-1', 'state-done');
-      expect(mockSdkCalls.issue.length).toBe(1);
+      const children = await client.getChildIssueSnapshots('ENG-1');
+
+      expect(children.map((c) => c.identifier)).toEqual(['ENG-1', 'ENG-2', 'ENG-3']);
+      expect(mockSdkCalls.request.length).toBe(2);
+      expect(mockSdkCalls.request[1].variables.after).toBe('c1');
+      expect(children[0].labels).toEqual([]);
+      expect(children[0].blockedByIds).toEqual([]);
+      expect(mockSdkCalls.issue.length).toBe(0);
     });
   });
 

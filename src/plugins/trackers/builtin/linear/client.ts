@@ -82,6 +82,105 @@ export interface WorkflowStateSummary {
 }
 
 /**
+ * Flattened view of a Linear issue with every field the tracker needs.
+ * Fetched in a single GraphQL request so the tracker doesn't have to resolve
+ * SDK lazy relations (state, labels, assignee, parent, relations) one request at a time.
+ */
+export interface LinearIssueSnapshot {
+  id: string;
+  identifier: string;
+  title: string;
+  description: string | null;
+  url: string;
+  createdAt: string;
+  updatedAt: string;
+  /** Workflow state type ("triage", "backlog", "unstarted", "started", "completed", "canceled") */
+  stateType: string | null;
+  teamId: string | null;
+  parentIdentifier: string | null;
+  assigneeName: string | null;
+  labels: string[];
+  /** UUIDs of issues that block this issue */
+  blockedByIds: string[];
+}
+
+/**
+ * Page size for child issue snapshot queries. Nested connection sizes are kept
+ * small so each query stays well under Linear's per-query complexity limit.
+ */
+const SNAPSHOT_PAGE_SIZE = 50;
+
+const ISSUE_SNAPSHOT_FIELDS = `
+  id
+  identifier
+  title
+  description
+  url
+  createdAt
+  updatedAt
+  state { type }
+  team { id }
+  parent { identifier }
+  assignee { name displayName }
+  labels(first: 20) { nodes { name } }
+  inverseRelations(first: 25) { nodes { type issue { id } } }
+`;
+
+const ISSUE_SNAPSHOT_QUERY = `
+  query RalphIssueSnapshot($id: String!) {
+    issue(id: $id) { ${ISSUE_SNAPSHOT_FIELDS} }
+  }
+`;
+
+const CHILD_ISSUE_SNAPSHOTS_QUERY = `
+  query RalphChildIssueSnapshots($id: String!, $first: Int!, $after: String) {
+    issue(id: $id) {
+      children(first: $first, after: $after) {
+        nodes { ${ISSUE_SNAPSHOT_FIELDS} }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+
+/** Raw GraphQL shape of an issue returned by the snapshot queries. */
+interface RawIssueSnapshot {
+  id: string;
+  identifier: string;
+  title: string;
+  description?: string | null;
+  url: string;
+  createdAt: string;
+  updatedAt: string;
+  state?: { type: string } | null;
+  team?: { id: string } | null;
+  parent?: { identifier: string } | null;
+  assignee?: { name: string; displayName?: string | null } | null;
+  labels?: { nodes: Array<{ name: string }> } | null;
+  inverseRelations?: { nodes: Array<{ type: string; issue?: { id: string } | null }> } | null;
+}
+
+function toIssueSnapshot(raw: RawIssueSnapshot): LinearIssueSnapshot {
+  return {
+    id: raw.id,
+    identifier: raw.identifier,
+    title: raw.title,
+    description: raw.description ?? null,
+    url: raw.url,
+    createdAt: raw.createdAt,
+    updatedAt: raw.updatedAt,
+    stateType: raw.state?.type ?? null,
+    teamId: raw.team?.id ?? null,
+    parentIdentifier: raw.parent?.identifier ?? null,
+    assigneeName: raw.assignee?.displayName || raw.assignee?.name || null,
+    labels: (raw.labels?.nodes ?? []).map((l) => l.name),
+    blockedByIds: (raw.inverseRelations?.nodes ?? [])
+      .filter((rel) => rel.type === 'blocks' && rel.issue)
+      .map((rel) => rel.issue!.id),
+  };
+}
+
+/**
  * Resolve the API key from config or environment.
  * Config `apiKey` takes deterministic precedence over `LINEAR_API_KEY` env var.
  */
@@ -263,6 +362,81 @@ export class RalphLinearClient {
   }
 
   /**
+   * Get a snapshot of a single issue (identifier like "ENG-123" or UUID)
+   * including state, team, parent, assignee, labels, and blockers in one request.
+   */
+  async getIssueSnapshot(idOrKey: string): Promise<LinearIssueSnapshot> {
+    let data: { issue?: RawIssueSnapshot | null };
+    try {
+      data = await this.client.client.request<
+        { issue?: RawIssueSnapshot | null },
+        { id: string }
+      >(ISSUE_SNAPSHOT_QUERY, { id: idOrKey });
+    } catch (err) {
+      const classified = classifyError(err);
+      if (classified.kind === 'unknown') {
+        throw new LinearApiError(
+          `Issue "${idOrKey}" not found or inaccessible.`,
+          'not_found',
+          err,
+        );
+      }
+      throw classified;
+    }
+
+    if (!data.issue) {
+      throw new LinearApiError(
+        `Issue "${idOrKey}" not found or inaccessible.`,
+        'not_found',
+      );
+    }
+
+    return toIssueSnapshot(data.issue);
+  }
+
+  /**
+   * Get snapshots of all child issues of a parent issue.
+   * Costs one request per page of children instead of several requests per child.
+   */
+  async getChildIssueSnapshots(parentId: string): Promise<LinearIssueSnapshot[]> {
+    type ChildrenData = {
+      issue?: {
+        children: {
+          nodes: RawIssueSnapshot[];
+          pageInfo: { hasNextPage: boolean; endCursor?: string | null };
+        };
+      } | null;
+    };
+
+    try {
+      const snapshots: LinearIssueSnapshot[] = [];
+      let after: string | undefined;
+
+      do {
+        const data: ChildrenData = await this.client.client.request<
+          ChildrenData,
+          { id: string; first: number; after?: string }
+        >(CHILD_ISSUE_SNAPSHOTS_QUERY, { id: parentId, first: SNAPSHOT_PAGE_SIZE, after });
+
+        if (!data.issue) {
+          throw new LinearApiError(
+            `Issue "${parentId}" not found or inaccessible.`,
+            'not_found',
+          );
+        }
+
+        const { nodes, pageInfo } = data.issue.children;
+        snapshots.push(...nodes.map(toIssueSnapshot));
+        after = pageInfo.hasNextPage && pageInfo.endCursor ? pageInfo.endCursor : undefined;
+      } while (after);
+
+      return snapshots;
+    } catch (err) {
+      throw classifyError(err);
+    }
+  }
+
+  /**
    * Create an issue in Linear.
    */
   async createIssue(input: IssueCreateInput): Promise<CreatedIssue> {
@@ -293,8 +467,7 @@ export class RalphLinearClient {
    */
   async updateIssueState(issueId: string, stateId: string): Promise<void> {
     try {
-      const issue = await this.client.issue(issueId);
-      await issue.update({ stateId });
+      await this.client.updateIssue(issueId, { stateId });
     } catch (err) {
       throw classifyError(err);
     }

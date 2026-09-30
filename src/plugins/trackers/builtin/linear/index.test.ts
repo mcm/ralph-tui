@@ -12,10 +12,9 @@ import { describe, expect, test, beforeAll, beforeEach, mock } from 'bun:test';
 let mockCalls: {
   updateIssueState: Array<{ issueId: string; stateId: string }>;
   addComment: Array<{ issueId: string; body: string }>;
-  getIssue: Array<{ idOrKey: string }>;
-  getChildIssues: Array<{ parentId: string }>;
+  getIssueSnapshot: Array<{ idOrKey: string }>;
+  getChildIssueSnapshots: Array<{ parentId: string }>;
   getWorkflowStates: Array<{ teamId: string }>;
-  getBlockingIssueIds: Array<{ issueId: string }>;
 };
 
 /** Configurable mock responses */
@@ -30,10 +29,9 @@ function resetMockCalls(): void {
   mockCalls = {
     updateIssueState: [],
     addComment: [],
-    getIssue: [],
-    getChildIssues: [],
+    getIssueSnapshot: [],
+    getChildIssueSnapshots: [],
     getWorkflowStates: [],
-    getBlockingIssueIds: [],
   };
 }
 
@@ -88,6 +86,35 @@ function createMockIssue(opts: {
   };
 }
 
+type MockIssue = ReturnType<typeof createMockIssue>;
+
+/**
+ * Flatten a mock issue into the snapshot shape returned by the real client,
+ * taking blockers from the configurable getBlockingIssueIds response.
+ */
+async function toMockSnapshot(issue: MockIssue) {
+  const state = await issue.state;
+  const team = await issue.team;
+  const parent = await issue.parent;
+  const assignee = await issue.assignee;
+  const labels = await issue.labels();
+  return {
+    id: issue.id,
+    identifier: issue.identifier,
+    title: issue.title,
+    description: issue.description,
+    url: issue.url,
+    createdAt: issue.createdAt.toISOString(),
+    updatedAt: issue.updatedAt.toISOString(),
+    stateType: state?.type ?? null,
+    teamId: team?.id ?? null,
+    parentIdentifier: parent?.identifier ?? null,
+    assigneeName: assignee?.displayName ?? assignee?.name ?? null,
+    labels: labels.nodes.map((l) => l.name),
+    blockedByIds: mockResponses.getBlockingIssueIds(issue.id),
+  };
+}
+
 /** Default workflow states for mock */
 const defaultWorkflowStates = [
   { id: 'state-triage', name: 'Triage', type: 'triage' },
@@ -112,13 +139,15 @@ beforeAll(() => {
   mock.module('./client.js', () => {
     return {
       createLinearClient: () => ({
-        getIssue: async (idOrKey: string) => {
-          mockCalls.getIssue.push({ idOrKey });
-          return mockResponses.getIssue(idOrKey);
+        getIssueSnapshot: async (idOrKey: string) => {
+          mockCalls.getIssueSnapshot.push({ idOrKey });
+          return toMockSnapshot(mockResponses.getIssue(idOrKey) as MockIssue);
         },
-        getChildIssues: async (parentId: string) => {
-          mockCalls.getChildIssues.push({ parentId });
-          return mockResponses.getChildIssues(parentId);
+        getChildIssueSnapshots: async (parentId: string) => {
+          mockCalls.getChildIssueSnapshots.push({ parentId });
+          return Promise.all(
+            (mockResponses.getChildIssues(parentId) as MockIssue[]).map(toMockSnapshot),
+          );
         },
         getWorkflowStates: async (teamId: string) => {
           mockCalls.getWorkflowStates.push({ teamId });
@@ -127,10 +156,6 @@ beforeAll(() => {
         findWorkflowState: async (teamId: string, stateType: string) => {
           const states = mockResponses.getWorkflowStates(teamId);
           return (states as Array<{ type: string }>).find((s) => s.type === stateType);
-        },
-        getBlockingIssueIds: async (issueId: string) => {
-          mockCalls.getBlockingIssueIds.push({ issueId });
-          return mockResponses.getBlockingIssueIds(issueId);
         },
         updateIssueState: async (issueId: string, stateId: string) => {
           mockCalls.updateIssueState.push({ issueId, stateId });
@@ -187,8 +212,8 @@ describe('LinearTrackerPlugin', () => {
 
     test('resolves team from epic issue', async () => {
       await createInitializedPlugin('ENG-1');
-      expect(mockCalls.getIssue.length).toBeGreaterThanOrEqual(1);
-      expect(mockCalls.getIssue[0].idOrKey).toBe('ENG-1');
+      expect(mockCalls.getIssueSnapshot.length).toBeGreaterThanOrEqual(1);
+      expect(mockCalls.getIssueSnapshot[0].idOrKey).toBe('ENG-1');
     });
 
     test('meta has correct id and capabilities', async () => {
@@ -673,7 +698,7 @@ describe('LinearTrackerPlugin', () => {
       const task = await plugin.getTask('ENG-42');
 
       expect(task).toBeDefined();
-      expect(mockCalls.getIssue.some((c) => c.idOrKey === 'ENG-42')).toBe(true);
+      expect(mockCalls.getIssueSnapshot.some((c) => c.idOrKey === 'ENG-42')).toBe(true);
     });
 
     test('resolves issue by UUID', async () => {
@@ -685,7 +710,7 @@ describe('LinearTrackerPlugin', () => {
       const task = await plugin.getTask(uuid);
 
       expect(task).toBeDefined();
-      expect(mockCalls.getIssue.some((c) => c.idOrKey === uuid)).toBe(true);
+      expect(mockCalls.getIssueSnapshot.some((c) => c.idOrKey === uuid)).toBe(true);
     });
 
     test('returns undefined for not-found issue', async () => {
@@ -845,6 +870,43 @@ describe('LinearTrackerPlugin', () => {
 
       const context = await plugin.getPrdContext();
       expect(context).toBeNull();
+    });
+  });
+
+  describe('API request budget', () => {
+    function childIssues() {
+      return [1, 2, 3].map((n) =>
+        createMockIssue({
+          id: `uuid-${n}`,
+          identifier: `ENG-${10 + n}`,
+          title: `Task ${n}`,
+          parentIdentifier: 'ENG-1',
+        }),
+      );
+    }
+
+    test('repeated reads share one child fetch', async () => {
+      mockResponses.getChildIssues = childIssues;
+      const plugin = await createInitializedPlugin();
+
+      await Promise.all([plugin.getTasks(), plugin.getNextTask()]);
+      await plugin.getTasks({ status: ['open'] });
+      await plugin.getEpics();
+      await plugin.getPrdContext();
+
+      expect(mockCalls.getChildIssueSnapshots.length).toBe(1);
+    });
+
+    test('writes invalidate cached children', async () => {
+      mockResponses.getChildIssues = childIssues;
+      const plugin = await createInitializedPlugin();
+
+      await plugin.getTasks();
+      await plugin.completeTask('ENG-11');
+      await plugin.getTasks();
+
+      // Initial read, then one refetch after the write
+      expect(mockCalls.getChildIssueSnapshots.length).toBe(2);
     });
   });
 });
